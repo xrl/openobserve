@@ -52,31 +52,11 @@ static FILES: Lazy<Vec<RwLock<FileData>>> = Lazy::new(|| {
     files
 });
 
-// read only parquet cache
-static FILES_READER: Lazy<Vec<FileData>> = Lazy::new(|| {
-    let cfg = get_config();
-    let mut files = Vec::with_capacity(cfg.disk_cache.bucket_num);
-    for _ in 0..cfg.disk_cache.bucket_num {
-        files.push(FileData::new(FileType::Data));
-    }
-    files
-});
-
 static RESULT_FILES: Lazy<Vec<RwLock<FileData>>> = Lazy::new(|| {
     let cfg = get_config();
     let mut files = Vec::with_capacity(cfg.disk_cache.bucket_num);
     for _ in 0..cfg.disk_cache.bucket_num {
         files.push(RwLock::new(FileData::new(FileType::Result)));
-    }
-    files
-});
-
-// read only
-static RESULT_FILES_READER: Lazy<Vec<FileData>> = Lazy::new(|| {
-    let cfg = get_config();
-    let mut files = Vec::with_capacity(cfg.disk_cache.bucket_num);
-    for _ in 0..cfg.disk_cache.bucket_num {
-        files.push(FileData::new(FileType::Result));
     }
     files
 });
@@ -91,15 +71,14 @@ static AGGREGATION_FILES: Lazy<Vec<RwLock<FileData>>> = Lazy::new(|| {
     files
 });
 
-// read only aggregation cache
-static AGGREGATION_FILES_READER: Lazy<Vec<FileData>> = Lazy::new(|| {
-    let cfg = get_config();
-    let mut files = Vec::with_capacity(cfg.disk_cache.bucket_num);
-    for _ in 0..cfg.disk_cache.bucket_num {
-        files.push(FileData::new(FileType::Aggregation));
-    }
-    files
-});
+/// Read-only view of the cache directory.
+///
+/// The read path only ever resolves a cache key to its on-disk path, and every
+/// bucket of every cache type resolves it the same way (`root_dir` and
+/// `multi_dir` do not vary), so one instance replaces what used to be three
+/// `Vec<FileData>` mirrors of `bucket_num` entries each -- each of those
+/// carrying an index it never populated.
+static FILES_READER: Lazy<FileData> = Lazy::new(|| FileData::new(FileType::Data));
 
 pub static QUERY_RESULT_CACHE: Lazy<RwAHashMap<String, Vec<ResultCacheMeta>>> =
     Lazy::new(Default::default);
@@ -441,18 +420,23 @@ pub async fn init() -> Result<(), anyhow::Error> {
     }
     std::fs::create_dir_all(&cfg.common.data_tmp_dir).expect("create tmp dir success");
 
+    if !cfg.disk_cache.enabled {
+        // Every read and write path already returns early when the cache is
+        // disabled, so there is nothing to index: skip the boot scan, which
+        // walks the whole cache dir and holds a key per file forever, and skip
+        // forcing the bucket statics. Waiters on the load (the metrics result
+        // cache) must still be released.
+        LOADING_FROM_DISK_DONE.store(true, Ordering::SeqCst);
+        log::info!("Disk cache is disabled, skipping the cache dir scan");
+        return Ok(());
+    }
+
     for file in FILES.iter() {
         let root_dir = file.read().await.root_dir.clone();
         std::fs::create_dir_all(&root_dir).expect("create cache dir success");
     }
-    // trigger read only files
-    for file in FILES_READER.iter() {
-        std::fs::create_dir_all(&file.root_dir).expect("create cache dir success");
-    }
-    // trigger read only aggregation files
-    for file in AGGREGATION_FILES_READER.iter() {
-        std::fs::create_dir_all(&file.root_dir).expect("create cache dir success");
-    }
+    // trigger the read only view
+    std::fs::create_dir_all(&FILES_READER.root_dir).expect("create cache dir success");
 
     tokio::task::spawn(async move {
         log::info!("Loading disk cache start");
@@ -476,26 +460,17 @@ pub async fn init() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The read-only view of the cache, or `None` when the cache is disabled.
 #[inline]
-fn get_file_reader(file: &str) -> Option<&FileData> {
+fn get_file_reader() -> Option<&'static FileData> {
     if !get_config().disk_cache.enabled {
         return None;
     }
-    let idx = get_bucket_idx(file);
-    let files = if file.starts_with("files") {
-        FILES_READER.get(idx).unwrap()
-    } else if file.starts_with("results") {
-        RESULT_FILES_READER.get(idx).unwrap()
-    } else if file.starts_with("aggregations") {
-        AGGREGATION_FILES_READER.get(idx).unwrap()
-    } else {
-        RESULT_FILES_READER.get(idx).unwrap()
-    };
-    Some(files)
+    Some(&FILES_READER)
 }
 
 pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<GetResult> {
-    let Some(files) = get_file_reader(file) else {
+    let Some(files) = get_file_reader() else {
         return Err(object_store::Error::NotFound {
             path: file.to_string(),
             source: Box::new(std::io::Error::other("file not found")),
@@ -534,13 +509,13 @@ pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<G
 
 #[inline]
 pub async fn get(file: &str, range: Option<Range<u64>>) -> Option<Bytes> {
-    let files = get_file_reader(file)?;
+    let files = get_file_reader()?;
     files.get(file, range).await
 }
 
 #[inline]
 pub async fn get_size(file: &str) -> Option<usize> {
-    let files = get_file_reader(file)?;
+    let files = get_file_reader()?;
     files.get_size(file).await
 }
 
@@ -557,7 +532,7 @@ pub async fn get_size(file: &str) -> Option<usize> {
 pub async fn get_ranges(file: &str, ranges: &[Range<u64>]) -> object_store::Result<Vec<Bytes>> {
     use std::os::unix::fs::FileExt;
 
-    let Some(files) = get_file_reader(file) else {
+    let Some(files) = get_file_reader() else {
         return Err(object_store::Error::NotFound {
             path: file.to_string(),
             source: Box::new(std::io::Error::other("file not found")),
@@ -610,7 +585,7 @@ pub async fn get_ranges(file: &str, ranges: &[Range<u64>]) -> object_store::Resu
 
 #[inline]
 pub fn get_file_path(file: &str) -> Option<String> {
-    let files = get_file_reader(file)?;
+    let files = get_file_reader()?;
     Some(files.get_file_path(file))
 }
 
@@ -1151,6 +1126,23 @@ async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read path collapsed three per-cache-type mirrors into one, which is
+    /// only sound because the on-disk path never depended on the cache type.
+    #[test]
+    fn read_paths_do_not_depend_on_the_cache_type() {
+        let data = FileData::new(FileType::Data);
+        let result = FileData::new(FileType::Result);
+        let aggregation = FileData::new(FileType::Aggregation);
+        for key in [
+            "files/default/logs/disk/2022/10/03/10/123_1_1.parquet",
+            "results/default/logs/disk/2022/10/03/10/123.json",
+            "aggregations/default/logs/disk/2022/10/03/10/123.json",
+        ] {
+            assert_eq!(data.get_file_path(key), result.get_file_path(key));
+            assert_eq!(data.get_file_path(key), aggregation.get_file_path(key));
+        }
+    }
 
     #[tokio::test]
     async fn test_disk_lru_cache_set_file() {
