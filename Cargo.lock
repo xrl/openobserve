@@ -8127,6 +8127,7 @@ dependencies = [
  "o2_enterprise",
  "o2_openfga",
  "openobserve-node",
+ "openobserve-synthetics",
  "opentelemetry",
  "opentelemetry-proto",
  "parking_lot 0.12.5",
@@ -8317,6 +8318,7 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "usage_reporting",
 ]
 
 [[package]]
