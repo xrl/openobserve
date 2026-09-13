@@ -1,0 +1,322 @@
+name: Study build (low-memory)
+
+# Builds three linux/arm64 variants of the OpenObserve binary from any commit on
+# a study branch and pushes each one to GHCR, so a measurement host can pull them
+# by digest:
+#
+#   mimalloc   the vendor recipe (release-prod + mimalloc, distroless runtime)
+#   sysalloc   release-prod with no features, i.e. glibc malloc, tools runtime
+#   profiling  release-profiling + profiling (jemalloc + pprof), tools runtime
+#
+# The web UI is built once and shared, because the Rust binary embeds web/dist
+# through rust-embed (src/web/src/lib.rs). Building it per variant would make the
+# embedded blob, and therefore the binaries, differ for reasons unrelated to the
+# allocator.
+
+on:
+  push:
+    branches:
+      - "study/**"
+      - "low-memory"
+  workflow_dispatch:
+
+concurrency:
+  group: study-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: nightly-2026-05-20
+  BUILD_TARGET: aarch64-unknown-linux-gnu
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  web:
+    name: Build web UI
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - uses: ./.github/actions/github-auth
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build UI
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+        run: |
+          cd web
+          npm ci
+          npm run build
+          # rust-embed is declared #[allow_missing = true]; an empty dist would
+          # silently produce a binary that serves no UI instead of failing here.
+          test -s dist/index.html
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.variant }}
+    needs: [web]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: mimalloc
+            profile: release-prod
+            features: "--features mimalloc"
+            dockerfile: deploy/build/Dockerfile.study.distroless.aarch64
+            runtime: gcr.io/distroless/cc-debian13:latest-arm64
+          - variant: sysalloc
+            profile: release-prod
+            features: ""
+            dockerfile: deploy/build/Dockerfile.study.tools.aarch64
+            runtime: debian:trixie-slim
+          - variant: profiling
+            profile: release-profiling
+            features: "--features profiling"
+            dockerfile: deploy/build/Dockerfile.study.tools.aarch64
+            runtime: debian:trixie-slim
+    steps:
+      - name: Reclaim disk and add swap
+        run: |
+          # release-prod is codegen-units=1 + thin LTO and release-profiling
+          # keeps full debug info; both are disk- and RAM-hungry on a 4 vCPU /
+          # 16 GB runner. The vendor buildspec adds 32 GB of swap for the same
+          # reason.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+          df -h / /mnt
+
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - uses: ./.github/actions/github-auth
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install --no-install-recommends \
+            libssl-dev pkg-config gcc g++ cmake clang libunwind-dev unzip
+          # .cargo/config.toml pins linker = "aarch64-linux-gnu-gcc" for this
+          # target. On a native arm64 host that name normally comes from
+          # gcc-defaults; if the image does not ship it, point it at the native
+          # compiler rather than dropping the target's +aes,+neon rustflags.
+          command -v aarch64-linux-gnu-gcc \
+            || sudo ln -s "$(command -v gcc)" /usr/local/bin/aarch64-linux-gnu-gcc
+          command -v aarch64-linux-gnu-g++ \
+            || sudo ln -s "$(command -v g++)" /usr/local/bin/aarch64-linux-gnu-g++
+
+      - name: Install Protoc
+        run: bash ./.github/protoc.sh
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.BUILD_TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: study-${{ matrix.variant }}
+          cache-on-failure: true
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: web/dist
+
+      - name: Output package versions
+        run: |
+          protoc --version; cargo version; rustc --version; gcc --version | head -1
+          # RUSTFLAGS is deliberately unset: setting it would shadow the
+          # [target.aarch64-unknown-linux-gnu] rustflags in .cargo/config.toml,
+          # and gxhash needs the +aes those carry.
+          rustc --print cfg --target "$BUILD_TARGET" \
+            -C target-feature=+aes,+neon | grep -E 'aes|neon' || true
+
+      - name: Build binary
+        run: |
+          set -x
+          cargo build --profile ${{ matrix.profile }} ${{ matrix.features }} \
+            --target "$BUILD_TARGET"
+          mkdir -p docker-ctx
+          mv "target/$BUILD_TARGET/${{ matrix.profile }}/openobserve" docker-ctx/openobserve
+          chmod +x docker-ctx/openobserve
+          ls -l docker-ctx/openobserve
+          df -h /
+
+      - name: Inspect binary
+        id: binary
+        run: |
+          SIZE=$(stat -c %s docker-ctx/openobserve)
+          NEEDED=$(objdump -p docker-ctx/openobserve | awk '/NEEDED/ {printf "%s ", $2}')
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
+          echo "binary $SIZE bytes; NEEDED: $NEEDED"
+
+      - name: Compute tags
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          # refs/heads/study/build is not a legal docker tag; flatten the slashes.
+          # printf, not echo: tr -c would turn the trailing newline into a '-'
+          # that command substitution does not strip.
+          BRANCH_TAG=$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -c 'A-Za-z0-9_.-' '-')
+          {
+            echo "short_sha=$SHORT_SHA"
+            echo "branch_tag=$BRANCH_TAG"
+            echo "tags<<EOT"
+            echo "${IMAGE}:${SHORT_SHA}-${{ matrix.variant }}"
+            echo "${IMAGE}:${BRANCH_TAG}-${{ matrix.variant }}"
+            echo "EOT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          # A directory holding only the binary: the repo checkout plus a
+          # release-profiling target/ is tens of GB of build context otherwise.
+          context: docker-ctx
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            ai.openobserve.study.variant=${{ matrix.variant }}
+            ai.openobserve.study.profile=${{ matrix.profile }}
+            ai.openobserve.study.features=${{ matrix.features }}
+
+      - name: Record image digest
+        run: |
+          jq -n \
+            --arg variant   '${{ matrix.variant }}' \
+            --arg image     "$IMAGE" \
+            --arg digest    '${{ steps.push.outputs.digest }}' \
+            --arg profile   '${{ matrix.profile }}' \
+            --arg features  '${{ matrix.features }}' \
+            --arg runtime   '${{ matrix.runtime }}' \
+            --arg target    "$BUILD_TARGET" \
+            --arg size      '${{ steps.binary.outputs.size }}' \
+            --arg needed    '${{ steps.binary.outputs.needed }}' \
+            --arg short_sha '${{ steps.meta.outputs.short_sha }}' \
+            --arg branch    '${{ steps.meta.outputs.branch_tag }}' \
+            '{($variant): {
+                pull: ($image + "@" + $digest),
+                image: $image,
+                digest: $digest,
+                tags: [($short_sha + "-" + $variant), ($branch + "-" + $variant)],
+                profile: $profile,
+                features: $features,
+                target: $target,
+                runtime: $runtime,
+                binary_bytes: ($size | tonumber),
+                needed_libs: ($needed | split(" ") | map(select(length > 0)))
+             }}' > "image-${{ matrix.variant }}.json"
+          cat "image-${{ matrix.variant }}.json"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.variant }}
+          path: image-${{ matrix.variant }}.json
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ matrix.variant }}"
+            echo
+            echo '```'
+            echo "cargo build --profile ${{ matrix.profile }} ${{ matrix.features }} --target $BUILD_TARGET"
+            echo "runtime: ${{ matrix.runtime }}"
+            echo "$IMAGE@${{ steps.push.outputs.digest }}"
+            echo "binary: ${{ steps.binary.outputs.size }} bytes"
+            echo "NEEDED: ${{ steps.binary.outputs.needed }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  collect:
+    name: Collect digests
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: digests
+          merge-multiple: true
+
+      - name: Merge into study-images.json
+        run: |
+          jq -s \
+            --arg repo   "${GITHUB_REPOSITORY}" \
+            --arg ref    "${GITHUB_REF_NAME}" \
+            --arg sha    "${GITHUB_SHA}" \
+            --arg run    "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg built  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{repo: $repo, branch: $ref, sha: $sha, run_url: $run, built_at: $built,
+              images: (reduce .[] as $x ({}; . * $x))}' \
+            digests/*.json > study-images.json
+          cat study-images.json
+          {
+            echo "### study-images.json"
+            echo
+            echo '```json'
+            cat study-images.json
+            echo '```'
+            echo
+            echo "| variant | pull by digest |"
+            echo "| --- | --- |"
+            jq -r '.images | to_entries[] | "| \(.key) | `\(.value.pull)` |"' study-images.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload study-images.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: study-images
+          path: study-images.json
+          if-no-files-found: error

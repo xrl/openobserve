@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+#
+# Low-memory study runtime with an attribution toolchain.
+#
+# Same binary placement as Dockerfile.study.distroless.aarch64, but on a real
+# Debian trixie userland so the container has a shell, heaptrack and valgrind
+# (massif/dhat) for allocator attribution, and procps/curl for sampling RSS and
+# the /metrics endpoint from inside the container.
+#
+# `/openobserve` stays the default command, exactly as the vendor images do, so
+# `docker run <image>` still starts the server. It is CMD rather than ENTRYPOINT
+# on purpose: `docker run <image> bash` has to reach the shell for the tools to
+# be usable at all.
+#
+# Build context: a directory containing just the `openobserve` binary.
+
+FROM debian:trixie-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        procps \
+        heaptrack \
+        valgrind \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY openobserve /
+RUN ["/openobserve", "init-dir", "-p", "/data/"]
+CMD ["/openobserve"]
