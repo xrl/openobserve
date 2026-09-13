@@ -39,7 +39,6 @@ use openobserve_core::bootstrap;
 use openobserve_jobs::job;
 use tokio::sync::oneshot;
 use tracing_appender::non_blocking::WorkerGuard;
-use utoipa::OpenApi;
 #[cfg(feature = "enterprise")]
 use {config::Config, o2_enterprise::enterprise::common::config::O2Config};
 
@@ -191,7 +190,7 @@ async fn main() -> Result<(), anyhow::Error> {
             // tool (with its JSON schema) per operation, all retained for the
             // process lifetime, so a node that serves no MCP client can skip it.
             if get_config().common.mcp_enabled {
-                let api = openapi::ApiDoc::openapi();
+                let api = openapi::openapi_spec();
                 if let Err(e) = openobserve_mcp::tools::init_mcp_tools(&api) {
                     log::error!("Failed to initialize MCP tools: {e}");
                 } else {

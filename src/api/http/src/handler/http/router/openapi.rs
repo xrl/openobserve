@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::{Arc, LazyLock};
+
 use config::{get_config, meta::stream::StreamType};
 #[cfg(feature = "enterprise")]
 use o2_ratelimit::dataresource::default_rules::OpenapiInfo;
@@ -31,6 +33,21 @@ use crate::{
     common::meta,
     handler::http::request::{mcp, ratelimit},
 };
+
+/// The OpenAPI spec, built at most once per process.
+///
+/// Building it materialises every annotated path and component schema -- tens
+/// of MB of `String`s and schema nodes -- and every consumer keeps what it is
+/// handed for the process lifetime. It is a `LazyLock` so a node with both
+/// `ZO_SWAGGER_ENABLED=false` and `ZO_MCP_ENABLED=false` never builds it at
+/// all.
+static OPENAPI_SPEC: LazyLock<Arc<utoipa::openapi::OpenApi>> =
+    LazyLock::new(|| Arc::new(ApiDoc::openapi()));
+
+/// The shared OpenAPI spec, built on first use.
+pub fn openapi_spec() -> Arc<utoipa::openapi::OpenApi> {
+    OPENAPI_SPEC.clone()
+}
 
 #[derive(OpenApi)]
 #[openapi(

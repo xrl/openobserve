@@ -41,7 +41,6 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     decompression::RequestDecompressionLayer,
 };
-use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 #[cfg(feature = "enterprise")]
 use {
@@ -667,9 +666,11 @@ pub fn basic_routes() -> Router {
 
     // Swagger UI
     if get_config().common.swagger_enabled {
-        router = router.merge(
-            SwaggerUi::new("/swagger").url("/api-doc/openapi.json", openapi::ApiDoc::openapi()),
-        );
+        // `SwaggerUi::url` takes an owned `OpenApi` and keeps it for the
+        // process lifetime, so this path is the one place that clones the
+        // shared spec instead of sharing the `Arc`.
+        let spec = openapi::openapi_spec().as_ref().clone();
+        router = router.merge(SwaggerUi::new("/swagger").url("/api-doc/openapi.json", spec));
         router = router.route("/docs", get(|| async { Redirect::permanent("/swagger/") }));
     }
 
@@ -1733,6 +1734,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use serde_json::Value;
     use tower::ServiceExt;
+    use utoipa::OpenApi;
 
     use super::*;
 
