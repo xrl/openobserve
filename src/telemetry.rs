@@ -45,8 +45,13 @@ pub fn setup_logs() -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
     let cfg = get_config();
+    // The appender hands log lines to its writer thread over a bounded
+    // crossbeam channel that is allocated in full up front, so the line limit
+    // is a fixed boot cost: the 128000 default is ~4 MB.
+    let builder = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(cfg.log.buffer_lines);
     let (writer, guard) = if cfg.log.file_dir.is_empty() {
-        let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
+        let (non_blocking, _guard) = builder.finish(std::io::stdout());
         (BoxMakeWriter::new(non_blocking), _guard)
     } else {
         let file_name_prefix = if cfg.log.file_name_prefix.is_empty() {
@@ -55,7 +60,7 @@ pub fn setup_logs() -> tracing_appender::non_blocking::WorkerGuard {
             cfg.log.file_name_prefix.to_string()
         };
         let file_appender = tracing_appender::rolling::daily(&cfg.log.file_dir, file_name_prefix);
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, _guard) = builder.finish(file_appender);
         (BoxMakeWriter::new(non_blocking), _guard)
     };
     let layer = if cfg.log.json_format {

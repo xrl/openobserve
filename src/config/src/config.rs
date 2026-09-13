@@ -2881,6 +2881,12 @@ pub struct Log {
     // logger timestamp local setup, eg: %Y-%m-%dT%H:%M:%SZ
     #[env_config(name = "ZO_LOG_LOCAL_TIME_FORMAT", default = "")]
     pub local_time_format: String,
+    #[env_config(
+        name = "ZO_LOG_BUFFER_LINES",
+        default = 128000,
+        help = "Lines buffered between the log macros and the writer thread. The bounded channel is allocated in full at boot: the 128000 default costs ~4 MB."
+    )]
+    pub buffer_lines: usize,
 }
 
 #[derive(Serialize, Debug, EnvConfig, Default)]
