@@ -51,6 +51,20 @@ static WATCHERS: Lazy<RwLock<FxIndexMap<String, EventChannel>>> =
 
 type EventChannel = Arc<mpsc::Sender<Event>>;
 
+/// Apply `ZO_SQLITE_CACHE_SIZE_KB` as `PRAGMA cache_size`.
+///
+/// Sqlite's own default is ~2 MB of page cache *per connection*, held inside
+/// libsqlite3 where no Rust heap profiler can see it and no config surface
+/// could reach it. A negative `cache_size` is a KiB budget rather than a page
+/// count; 0 leaves sqlite's default alone.
+fn with_cache_size(opts: SqliteConnectOptions) -> SqliteConnectOptions {
+    let cache_size_kb = config::get_config().limit.sqlite_cache_size_kb;
+    if cache_size_kb == 0 {
+        return opts;
+    }
+    opts.pragma("cache_size", format!("-{cache_size_kb}"))
+}
+
 fn connect_rw() -> Pool<Sqlite> {
     let cfg = config::get_config();
     let url = format!("{}{}", cfg.common.data_db_dir, "metadata.sqlite");
@@ -64,13 +78,15 @@ fn connect_rw() -> Pool<Sqlite> {
     let idle_timeout = zero_or(cfg.limit.sql_db_connections_idle_timeout, 600);
     let max_lifetime = zero_or(cfg.limit.sql_db_connections_max_lifetime, 1800);
 
-    let db_opts = SqliteConnectOptions::from_str(&url)
-        .expect("sqlite connect options create failed")
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .locking_mode(SqliteLockingMode::Normal)
-        .busy_timeout(Duration::from_secs(acquire_timeout))
-        .create_if_missing(true);
+    let db_opts = with_cache_size(
+        SqliteConnectOptions::from_str(&url)
+            .expect("sqlite connect options create failed")
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .locking_mode(SqliteLockingMode::Normal)
+            .busy_timeout(Duration::from_secs(acquire_timeout))
+            .create_if_missing(true),
+    );
 
     // SQLite has one writer anyway. A second write connection only lets a
     // deferred transaction upgrade onto a moved snapshot, which fails as
@@ -88,14 +104,16 @@ fn connect_ro() -> Pool<Sqlite> {
     let cfg = config::get_config();
 
     let url = format!("{}{}", cfg.common.data_db_dir, "metadata.sqlite");
-    let db_opts = SqliteConnectOptions::from_str(&url)
-        .expect("sqlite connect options create failed")
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .locking_mode(SqliteLockingMode::Normal)
-        .busy_timeout(Duration::from_secs(30))
-        // .disable_statement_logging()
-        .read_only(true);
+    let db_opts = with_cache_size(
+        SqliteConnectOptions::from_str(&url)
+            .expect("sqlite connect options create failed")
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .locking_mode(SqliteLockingMode::Normal)
+            .busy_timeout(Duration::from_secs(30))
+            // .disable_statement_logging()
+            .read_only(true),
+    );
 
     let max_lifetime = if cfg.limit.sql_db_connections_max_lifetime > 0 {
         Some(std::time::Duration::from_secs(

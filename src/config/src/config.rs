@@ -2534,6 +2534,12 @@ pub struct Limit {
     pub quick_mode_strategy: String, // first, last, both
     #[env_config(name = "ZO_META_CONNECTION_POOL_MIN_SIZE", default = 0)] // number of connections
     pub sql_db_connections_min: u32,
+    #[env_config(
+        name = "ZO_SQLITE_CACHE_SIZE_KB",
+        default = 0,
+        help = "Page cache per sqlite connection, in KiB (PRAGMA cache_size). 0 keeps sqlite's own default of ~2 MB per connection."
+    )]
+    pub sqlite_cache_size_kb: u64,
     #[env_config(name = "ZO_META_CONNECTION_POOL_MAX_SIZE", default = 0)] // number of connections
     pub sql_db_connections_max: u32,
     #[env_config(
@@ -3479,7 +3485,13 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
 
     if cfg.limit.sql_db_connections_min == 0 {
-        cfg.limit.sql_db_connections_min = MINIMUM_DB_CONNECTIONS;
+        // Local mode is sqlite: every connection carries its own page cache, so
+        // a second idle connection is pure overhead.
+        cfg.limit.sql_db_connections_min = if cfg.common.local_mode {
+            1
+        } else {
+            MINIMUM_DB_CONNECTIONS
+        };
     }
 
     if cfg.limit.sql_db_connections_max == 0 {
