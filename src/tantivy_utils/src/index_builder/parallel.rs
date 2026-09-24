@@ -35,7 +35,7 @@ use vortex::{
     session::VortexSession,
 };
 
-use super::{TantivyIndexSchema, convert_batch_to_docs_sync};
+use super::{TantivyIndexSchema, convert_batch_to_docs_sync, writer_memory_budget};
 use crate::index_builder::reader::{ChunkSelector, chunk_iter};
 
 pub(super) async fn build_index<D: tantivy::Directory + Send + Sync + 'static>(
@@ -144,6 +144,8 @@ where
         return Ok(None);
     }
 
+    let mem_budget = writer_memory_budget(buf.len() / num_chunks);
+
     // single chunk fast path — write directly into the caller-supplied dir, no merge
     if num_chunks == 1 {
         let start = std::time::Instant::now();
@@ -151,7 +153,7 @@ where
         let SegmentOutput {
             index, row_count, ..
         } = tokio::task::spawn_blocking(move || {
-            build_segment(0, buf, selector, index_schema, tantivy_dir)
+            build_segment(0, buf, selector, index_schema, tantivy_dir, mem_budget)
         })
         .await??;
         log::info!(
@@ -174,7 +176,7 @@ where
         tasks.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let dir = MmapDirectory::create_from_tempdir()?;
-            build_segment(chunk_idx, buf_c, selector, index_schema_c, dir)
+            build_segment(chunk_idx, buf_c, selector, index_schema_c, dir, mem_budget)
         }));
     }
 
@@ -230,6 +232,7 @@ fn build_segment<D: tantivy::Directory>(
     selector: ChunkSelector,
     index_schema: TantivyIndexSchema,
     dir: D,
+    mem_budget: usize,
 ) -> Result<SegmentOutput, Error> {
     let mut projection: Vec<String> = index_schema.fields.iter().cloned().collect();
     projection.push(TIMESTAMP_COL_NAME.to_string());
@@ -242,7 +245,7 @@ fn build_segment<D: tantivy::Directory>(
     let mut writer = tantivy::IndexBuilder::new()
         .schema(index_schema.schema.clone())
         .tokenizers(tokenizer_manager)
-        .single_segment_index_writer::<tantivy::TantivyDocument>(dir, 50_000_000)?;
+        .single_segment_index_writer::<tantivy::TantivyDocument>(dir, mem_budget)?;
 
     let mut row_count: usize = 0;
     for batch_res in iter {

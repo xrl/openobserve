@@ -28,7 +28,7 @@ use tantivy::{
 
 use super::{FOOTER_CACHE, footer_cache::build_footer_cache};
 use crate::{
-    puffin::{BlobTypes, writer::PuffinBytesWriter},
+    puffin::{BlobTypes, MAGIC_SIZE, MIN_DATA_SIZE, writer::PuffinBytesWriter},
     puffin_directory::{ALLOWED_FILE_EXT, META_JSON},
 };
 /// Puffin directory is a puffin file which contains all the tantivy files.
@@ -88,13 +88,6 @@ impl PuffinDirWriter {
 
     // This function will serialize the directory into a single puffin file
     pub fn to_puffin_bytes(&self) -> Result<Vec<u8>> {
-        let mut puffin_buf: Vec<u8> = Vec::new();
-        let mut puffin_writer = PuffinBytesWriter::new(&mut puffin_buf);
-        for (k, v) in self.properties.read().expect("poisoned lock").iter() {
-            puffin_writer.set_property(k.clone(), v.clone());
-        }
-        let mut segment_id = String::new();
-
         let file_paths = self.file_paths.read().expect("poisoned lock");
         let allowed_file_paths = file_paths.iter().filter(|path| {
             let mut allowed = false;
@@ -110,12 +103,38 @@ impl PuffinDirWriter {
             };
             allowed
         });
-        for path in allowed_file_paths.clone() {
+        let files = allowed_file_paths
+            .map(|path| Ok((path, self.mmap_directory.open_read(path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let meta_bytes = build_footer_cache(self.mmap_directory.clone())?;
+        let properties = self.properties.read().expect("poisoned lock");
+
+        // Every blob length is known before writing, so allocate once instead of growing (and
+        // copying) the whole index by doubling. Only the JSON footer is estimated, generously.
+        let capacity = (MAGIC_SIZE + MIN_DATA_SIZE) as usize
+            + files
+                .iter()
+                .map(|(path, file)| file.len() + path.as_os_str().len() + 256)
+                .sum::<usize>()
+            + meta_bytes.len()
+            + FOOTER_CACHE.len()
+            + 256
+            + properties
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 8)
+                .sum::<usize>();
+        let mut puffin_buf: Vec<u8> = Vec::with_capacity(capacity);
+        let mut puffin_writer = PuffinBytesWriter::new(&mut puffin_buf);
+        for (k, v) in properties.iter() {
+            puffin_writer.set_property(k.clone(), v.clone());
+        }
+        let mut segment_id = String::new();
+
+        for (path, file_data) in files {
             if segment_id.is_empty() && path.extension().is_some_and(|ext| ext != "json") {
                 segment_id = path.file_stem().unwrap().to_str().unwrap().to_owned();
             }
 
-            let file_data = self.mmap_directory.open_read(path)?;
             log::debug!(
                 "Serializing file to puffin: len: {}, path: {}",
                 file_data.len(),
@@ -131,7 +150,6 @@ impl PuffinDirWriter {
         }
 
         // write footer cache
-        let meta_bytes = build_footer_cache(self.mmap_directory.clone())?;
         puffin_writer
             .add_blob(
                 &meta_bytes,
