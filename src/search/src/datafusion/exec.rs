@@ -13,7 +13,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{cmp::max, num::NonZero, str::FromStr, sync::Arc};
+use std::{
+    cmp::max,
+    num::NonZero,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
 use arrow_schema::Field;
 use config::{
@@ -38,7 +43,10 @@ use datafusion::{
     execution::{
         cache::cache_manager::{CacheManagerConfig, FileStatisticsCache},
         context::SessionConfig,
-        memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{
+            FairSpillPool, GreedyMemoryPool, MemoryLimit, MemoryPool, TrackConsumersPool,
+            UnboundedMemoryPool,
+        },
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
     },
@@ -67,6 +75,21 @@ use crate::{
 };
 
 pub const DATAFUSION_MIN_MEM: usize = 1024 * 1024 * 256; // 256MB
+
+// One pool for every query, merge and compaction in the process: a pool per RuntimeEnv
+// let N concurrent executions each claim the full `datafusion_max_size`.
+static DATAFUSION_MEMORY_POOL: LazyLock<std::result::Result<Arc<dyn MemoryPool>, String>> =
+    LazyLock::new(|| {
+        let cfg = get_config();
+        let memory_size = max(DATAFUSION_MIN_MEM, cfg.memory_cache.datafusion_max_size);
+        let pool: Arc<dyn MemoryPool> =
+            match super::MemoryPoolType::from_str(&cfg.memory_cache.datafusion_memory_pool)? {
+                super::MemoryPoolType::Greedy => Arc::new(GreedyMemoryPool::new(memory_size)),
+                super::MemoryPoolType::Fair => Arc::new(FairSpillPool::new(memory_size)),
+                super::MemoryPoolType::None => Arc::new(UnboundedMemoryPool::default()),
+            };
+        Ok(pool)
+    });
 
 fn create_session_config(
     sort_order: FileSortOrder,
@@ -164,28 +187,16 @@ pub async fn create_runtime_env(trace_id: &str, memory_limit: usize) -> Result<R
         builder = builder.with_cache_manager(cache_config);
     }
 
-    let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
-    let mem_pool = super::MemoryPoolType::from_str(&cfg.memory_cache.datafusion_memory_pool)
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
-        })?;
-    let memory_pool = match mem_pool {
-        super::MemoryPoolType::Greedy => {
-            let pool = GreedyMemoryPool::new(memory_size);
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
-        }
-        super::MemoryPoolType::Fair => {
-            let pool = FairSpillPool::new(memory_size);
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
-        }
-        super::MemoryPoolType::None => {
-            let pool = UnboundedMemoryPool::default();
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
-        }
-    };
+    let shared_pool = DATAFUSION_MEMORY_POOL.as_ref().map_err(|e| {
+        DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
+    })?;
+    let mut peak_pool = PeakMemoryPool::new(shared_pool.clone(), trace_id.to_string());
+    // A work group may grant less than the shared pool; an unbounded pool stays unbounded.
+    if !matches!(shared_pool.memory_limit(), MemoryLimit::Infinite) {
+        peak_pool = peak_pool.with_limit(max(DATAFUSION_MIN_MEM, memory_limit));
+    }
+    // Outermost so an allocation failure names this query's top consumers only.
+    let memory_pool = TrackConsumersPool::new(peak_pool, NonZero::new(20).unwrap());
 
     builder = builder.with_memory_pool(Arc::new(memory_pool));
     builder.build()
