@@ -12,9 +12,11 @@ on:
     branches:
       - "campaign/run-*"
 
+# One branch carries every dispatch: GitHub Actions caches (sccache objects,
+# web/dist) are only readable from the branch that wrote them.
 concurrency:
-  group: campaign-build-${{ github.ref }}
-  cancel-in-progress: true
+  group: campaign-build-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
