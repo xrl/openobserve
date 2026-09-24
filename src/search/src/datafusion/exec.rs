@@ -44,8 +44,8 @@ use datafusion::{
         cache::cache_manager::{CacheManagerConfig, FileStatisticsCache},
         context::SessionConfig,
         memory_pool::{
-            FairSpillPool, GreedyMemoryPool, MemoryLimit, MemoryPool, TrackConsumersPool,
-            UnboundedMemoryPool,
+            FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool,
+            MemoryReservation, TrackConsumersPool, UnboundedMemoryPool,
         },
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
@@ -90,6 +90,50 @@ static DATAFUSION_MEMORY_POOL: LazyLock<std::result::Result<Arc<dyn MemoryPool>,
             };
         Ok(pool)
     });
+
+/// `TrackConsumersPool` needs a sized inner pool; this hands it the shared one.
+#[derive(Debug)]
+struct SharedPool(Arc<dyn MemoryPool>);
+
+impl std::fmt::Display for SharedPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl MemoryPool for SharedPool {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.0.register(consumer)
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.0.unregister(consumer)
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.0.grow(reservation, additional)
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.0.shrink(reservation, shrink)
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        self.0.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.0.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.0.memory_limit()
+    }
+}
 
 fn create_session_config(
     sort_order: FileSortOrder,
@@ -190,13 +234,14 @@ pub async fn create_runtime_env(trace_id: &str, memory_limit: usize) -> Result<R
     let shared_pool = DATAFUSION_MEMORY_POOL.as_ref().map_err(|e| {
         DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
     })?;
-    let mut peak_pool = PeakMemoryPool::new(shared_pool.clone(), trace_id.to_string());
+    let track_pool =
+        TrackConsumersPool::new(SharedPool(shared_pool.clone()), NonZero::new(20).unwrap());
+    // PeakMemoryPool stays outermost: plan_metrics downcasts the runtime's pool to it.
+    let mut memory_pool = PeakMemoryPool::new(Arc::new(track_pool), trace_id.to_string());
     // A work group may grant less than the shared pool; an unbounded pool stays unbounded.
     if !matches!(shared_pool.memory_limit(), MemoryLimit::Infinite) {
-        peak_pool = peak_pool.with_limit(max(DATAFUSION_MIN_MEM, memory_limit));
+        memory_pool = memory_pool.with_limit(max(DATAFUSION_MIN_MEM, memory_limit));
     }
-    // Outermost so an allocation failure names this query's top consumers only.
-    let memory_pool = TrackConsumersPool::new(peak_pool, NonZero::new(20).unwrap());
 
     builder = builder.with_memory_pool(Arc::new(memory_pool));
     builder.build()
@@ -970,6 +1015,13 @@ mod tests {
     async fn test_create_runtime_env() -> Result<()> {
         let memory_limit = 1024 * 1024 * 512; // 512MB
         let runtime_env = create_runtime_env("test", memory_limit).await?;
+        assert!(
+            runtime_env
+                .memory_pool
+                .clone()
+                .downcast_ref::<PeakMemoryPool>()
+                .is_some()
+        );
 
         // Check that object stores are registered
         let memory_url = url::Url::parse("memory:///").unwrap();
