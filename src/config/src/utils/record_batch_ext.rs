@@ -914,19 +914,32 @@ pub fn convert_json_to_record_batch(
     let records_len = data.len();
     let num_fields = schema.fields().len();
 
-    // Pre-allocate builders for all fields in schema
-    let mut builders: Vec<Box<dyn ArrayBuilder>> = schema
-        .fields()
-        .iter()
-        .map(|f| make_builder(f.data_type(), records_len))
-        .collect();
-
-    // Create field name to index mapping (amortize lookup cost)
+    // A stream schema is the union of every field ever seen, so most of it is
+    // absent from any one batch. A builder reserves value capacity up front and
+    // the memtable keeps that capacity until the file rotates; columns no record
+    // in this batch carries become a plain null array instead.
+    let mut present = vec![false; num_fields];
     let field_indices: HashMap<&str, usize> = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(idx, f)| (f.name().as_str(), idx))
+        .collect();
+    for record in data.iter() {
+        if let Some(obj) = record.as_object() {
+            for key in obj.keys() {
+                if let Some(&idx) = field_indices.get(key.as_str()) {
+                    present[idx] = true;
+                }
+            }
+        }
+    }
+
+    let mut builders: Vec<Option<Box<dyn ArrayBuilder>>> = schema
+        .fields()
+        .iter()
+        .zip(present.iter())
+        .map(|(f, &p)| p.then(|| make_builder(f.data_type(), records_len)))
         .collect();
 
     // Cache data types for faster access
@@ -948,14 +961,16 @@ pub fn convert_json_to_record_batch(
         for (key, value) in obj.iter() {
             if let Some(&idx) = field_indices.get(key.as_str()) {
                 field_present[idx] = true;
-                append_value_optimized(&mut builders[idx], data_types[idx], value)?;
+                if let Some(builder) = builders[idx].as_mut() {
+                    append_value_optimized(builder, data_types[idx], value)?;
+                }
             }
         }
 
         // Append null for missing fields (using bitmap check)
         for (idx, &is_present) in field_present.iter().enumerate() {
-            if !is_present {
-                append_null_optimized(&mut builders[idx], data_types[idx]);
+            if !is_present && let Some(builder) = builders[idx].as_mut() {
+                append_null_optimized(builder, data_types[idx]);
             }
         }
     }
@@ -963,7 +978,11 @@ pub fn convert_json_to_record_batch(
     // Build final RecordBatch
     let cols: Vec<ArrayRef> = builders
         .into_iter()
-        .map(|mut builder| builder.finish())
+        .zip(data_types.iter())
+        .map(|(builder, dt)| match builder {
+            Some(mut builder) => builder.finish(),
+            None => new_null_array(dt, records_len),
+        })
         .collect();
 
     RecordBatch::try_new(schema.clone(), cols)
