@@ -925,11 +925,21 @@ pub fn convert_json_to_record_batch(
         .enumerate()
         .map(|(idx, f)| (f.name().as_str(), idx))
         .collect();
+    // Utf8 builders otherwise start at 1 KiB of values and double as they grow;
+    // the memtable keeps whatever capacity they ended with.
+    let mut value_bytes = vec![0usize; num_fields];
     for record in data.iter() {
         if let Some(obj) = record.as_object() {
-            for key in obj.keys() {
+            for (key, value) in obj.iter() {
                 if let Some(&idx) = field_indices.get(key.as_str()) {
                     present[idx] = true;
+                    value_bytes[idx] += match value {
+                        serde_json::Value::String(s) => s.len(),
+                        serde_json::Value::Null => 0,
+                        serde_json::Value::Bool(_) => 5,
+                        serde_json::Value::Number(_) => 20,
+                        _ => 64,
+                    };
                 }
             }
         }
@@ -938,8 +948,21 @@ pub fn convert_json_to_record_batch(
     let mut builders: Vec<Option<Box<dyn ArrayBuilder>>> = schema
         .fields()
         .iter()
-        .zip(present.iter())
-        .map(|(f, &p)| p.then(|| make_builder(f.data_type(), records_len)))
+        .enumerate()
+        .map(|(idx, f)| {
+            present[idx].then(|| -> Box<dyn ArrayBuilder> {
+                match f.data_type() {
+                    DataType::Utf8 => {
+                        Box::new(StringBuilder::with_capacity(records_len, value_bytes[idx]))
+                    }
+                    DataType::LargeUtf8 => Box::new(LargeStringBuilder::with_capacity(
+                        records_len,
+                        value_bytes[idx],
+                    )),
+                    dt => make_builder(dt, records_len),
+                }
+            })
+        })
         .collect();
 
     // Cache data types for faster access
