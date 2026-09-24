@@ -150,6 +150,32 @@ pub fn num_blocks_for(ndv: u64, fpp: f64) -> u32 {
     blocks.min(u32::MAX as u64) as u32
 }
 
+/// Shrink a serialized SBBF to `num_blocks` by OR-ing each run of
+/// `current / num_blocks` adjacent blocks. The result is bit-identical to
+/// building at `num_blocks` directly: fastmap gives
+/// `block_index(h, B / r) == block_index(h, B) / r` and the in-block mask
+/// ignores `B`. `None` unless `num_blocks` divides the current block count.
+pub fn fold_bytes(bytes: &[u8], num_blocks: u32) -> Option<Vec<u8>> {
+    let current = bytes.len() / BLOCK_BYTES;
+    let target = num_blocks as usize;
+    if current == 0
+        || target == 0
+        || !bytes.len().is_multiple_of(BLOCK_BYTES)
+        || !current.is_multiple_of(target)
+    {
+        return None;
+    }
+    let ratio = current / target;
+    let mut out = vec![0u8; target * BLOCK_BYTES];
+    for (i, block) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
+        let start = (i / ratio) * BLOCK_BYTES;
+        for (d, s) in out[start..start + BLOCK_BYTES].iter_mut().zip(block) {
+            *d |= s;
+        }
+    }
+    Some(out)
+}
+
 /// Builder-side SBBF: owns the bitset, supports `insert` + full `check`.
 /// The reader side never instantiates this — it goes through
 /// [`check_block`] on a single fetched block instead.
@@ -242,6 +268,19 @@ mod tests {
         // 1.69M items at 0.01 FPR → 65536 blocks = 2 MB body (matches the
         // user's data-bloom fixture, which the parquet-based writer produced).
         assert_eq!(num_blocks_for(1_687_010, 0.01), 65536);
+    }
+
+    #[test]
+    fn fold_matches_direct_build() {
+        let mut big = Sbbf::new_with_num_blocks(64);
+        let mut small = Sbbf::new_with_num_blocks(8);
+        for i in 0..500u32 {
+            big.insert(&i.to_le_bytes());
+            small.insert(&i.to_le_bytes());
+        }
+        assert_eq!(fold_bytes(&big.to_bytes(), 8).unwrap(), small.to_bytes());
+        assert_eq!(fold_bytes(&big.to_bytes(), 64).unwrap(), big.to_bytes());
+        assert!(fold_bytes(&big.to_bytes(), 6).is_none());
     }
 
     #[test]

@@ -34,7 +34,10 @@
 //! data-retention to reap. Neither affects correctness, so neither
 //! propagates to the caller as a hard error.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -44,7 +47,7 @@ use config::{
     utils::{inverted_index::to_tantivy_name, time::now_micros},
 };
 use infra::{
-    bloom::{BloomWriter, FieldBloom, path::bloom_path},
+    bloom::{BLOCK_BYTES, BloomWriter, FieldBloom, fold_bytes, num_blocks_for, path::bloom_path},
     errors::Result,
     file_list as infra_file_list, storage,
 };
@@ -160,12 +163,9 @@ pub(crate) async fn build_for_stream(
     Ok(true)
 }
 
-// B for this chunk is sized from the chunk's MAX record count, used as
-// a safe NDV upper bound: a file can't hold more distinct values than
-// rows. This never under-sizes (no saturation) for the target
-// high-cardinality fields where distinct ≈ rows. It over-sizes for
-// fields that repeat heavily (distinct ≪ rows) — acceptable; exact
-// sizing would read each file's tantivy term count in a pre-pass.
+// Filters are built at a B sized from the chunk's MAX record count, a
+// safe NDV upper bound known before any term is read, then folded down
+// per field to the NDV actually seen (see `shrink_to_ndv`).
 async fn build_for_chunk(
     org_id: &str,
     bloom_ver: i64,
@@ -182,7 +182,7 @@ async fn build_for_chunk(
         .max()
         .unwrap_or(0)
         .max(1);
-    let num_blocks = infra::bloom::num_blocks_for(max_records, fpp);
+    let num_blocks = num_blocks_for(max_records, fpp);
 
     let mut all_blooms: Vec<FieldBloom> = Vec::new();
     let mut contributing_ids: Vec<i64> = Vec::new();
@@ -204,6 +204,7 @@ async fn build_for_chunk(
     if all_blooms.is_empty() {
         return Ok((0, 0, 0));
     }
+    let num_blocks = shrink_to_ndv(&mut all_blooms, num_blocks, fpp);
 
     // Distinct bloom_ver per chunk (base + idx) → distinct `.bf` path.
     let blob: Vec<u8> = BloomWriter::serialize(all_blooms).context("serialize blooms")?;
@@ -223,6 +224,30 @@ async fn build_for_chunk(
     let took = start.elapsed().as_millis() as u64;
 
     Ok((took, num_blocks, contributing_ids.len()))
+}
+
+// Exact NDV is known only after every file's terms have streamed in, so
+// shrink by folding rather than paying a tantivy pre-pass to size up
+// front. B stays uniform per field, not per file, because the transposed
+// layout needs one block index per value across the group. `n_items`
+// counts a term once per segment it appears in, which can only over-size.
+fn shrink_to_ndv(blooms: &mut [FieldBloom], num_blocks: u32, fpp: f64) -> u32 {
+    let mut max_items: HashMap<String, u32> = HashMap::new();
+    for b in blooms.iter() {
+        let e = max_items.entry(b.field.clone()).or_default();
+        *e = (*e).max(b.n_items);
+    }
+    let mut widest = 0;
+    for b in blooms.iter_mut() {
+        let target = num_blocks_for(max_items[&b.field] as u64, fpp);
+        if target < num_blocks
+            && let Some(folded) = fold_bytes(&b.bytes, target)
+        {
+            b.bytes = folded;
+        }
+        widest = widest.max((b.bytes.len() / BLOCK_BYTES) as u32);
+    }
+    widest
 }
 
 async fn build_for_file(
