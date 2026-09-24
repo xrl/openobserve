@@ -27,8 +27,9 @@ use serde::Deserialize;
 
 /// GET /debug/profile/memory
 ///
-/// Generate a memory profile (heap dump) in jeprof format.
-/// The profile can be analyzed with jeprof or converted to flamegraph.
+/// Write an unsymbolized pprof heap profile. Symbolizing in process keeps the
+/// parsed DWARF of the whole binary resident for the life of the process, so
+/// symbolize offline: `pprof -http : openobserve memory_profile_*.pb`.
 ///
 /// Returns: Binary profile data
 pub async fn memory_profile() -> Result<String, String> {
@@ -57,17 +58,6 @@ pub async fn memory_profile() -> Result<String, String> {
         .map_err(|e| format!("Failed to create profile directory: {e}"))?;
 
     let filename = format!("{}/memory_profile_{}.pb", profile_dir, timestamp);
-
-    std::fs::write(&filename, pprof_data)
-        .map_err(|e| format!("Failed to write profile file: {e}"))?;
-
-    // dump flamegraph
-    let pprof_data = prof_ctl
-        .dump_flamegraph()
-        .map_err(|e| format!("Failed to dump pprof: {e}"))?;
-
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("{}/memory_profile_graph_{}.svg", profile_dir, timestamp);
 
     std::fs::write(&filename, pprof_data)
         .map_err(|e| format!("Failed to write profile file: {e}"))?;

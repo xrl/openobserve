@@ -42,6 +42,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 #[cfg(feature = "enterprise")]
 use {config::Config, o2_enterprise::enterprise::common::config::O2Config};
 
+mod allocator_stats;
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -52,7 +54,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "profiling")]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 async fn flush_reporting() {
     #[cfg(feature = "enterprise")]
@@ -287,6 +289,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Start runtime metrics collector
     openobserve_node::runtime_metrics::start_metrics_collector().await;
+    openobserve_node::memory_metrics::start();
+    allocator_stats::start();
 
     // let node online
     let _ = cluster::set_online().await;
