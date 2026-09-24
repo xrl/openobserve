@@ -105,6 +105,16 @@ pub async fn create_tantivy_index(
     Ok(index_size)
 }
 
+/// Memory budget for a `SingleSegmentIndexWriter` fed `input_bytes` of file data.
+///
+/// That writer never flushes, so the budget only sizes the term hash table, which tantivy
+/// allocates up front at budget / 3 rounded down to a power of two, capped at 4 MiB. Sizing
+/// from the input stops small files paying for the full table; an undersized table grows.
+/// The floor stays well above the 24 KiB where tantivy rejects the budget.
+pub(super) fn writer_memory_budget(input_bytes: usize) -> usize {
+    input_bytes.saturating_mul(3).clamp(1_000_000, 50_000_000)
+}
+
 /// Bundle of the tantivy schema and the per-row metadata both build paths need.
 ///
 /// Built once by [`build_tantivy_schema`] and shared by the

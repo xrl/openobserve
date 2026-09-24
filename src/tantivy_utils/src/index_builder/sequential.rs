@@ -23,7 +23,7 @@ use config::{
 use futures::TryStreamExt;
 use tokio::task::JoinHandle;
 
-use super::{TantivyIndexSchema, convert_batch_to_docs_sync};
+use super::{TantivyIndexSchema, convert_batch_to_docs_sync, writer_memory_budget};
 use crate::index_builder::reader::file_stream;
 
 /// Create a tantivy index in the given directory for the input file bytes.
@@ -36,13 +36,14 @@ pub(super) async fn build_index<D: tantivy::Directory>(
     let start = std::time::Instant::now();
     let mut projection: Vec<String> = index_schema.fields.iter().cloned().collect();
     projection.push(TIMESTAMP_COL_NAME.to_string());
+    let mem_budget = writer_memory_budget(buf.len());
     let reader = file_stream(file_format, buf, Some(&projection)).await?;
     let tokenizer_manager = tantivy::tokenizer::TokenizerManager::default();
     tokenizer_manager.register(O2_TOKENIZER, o2_tokenizer_build(CollectType::Ingest));
     let index_writer = tantivy::IndexBuilder::new()
         .schema(index_schema.schema.clone())
         .tokenizers(tokenizer_manager)
-        .single_segment_index_writer(tantivy_dir, 50_000_000)
+        .single_segment_index_writer(tantivy_dir, mem_budget)
         .context("failed to create index builder")?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(2);
