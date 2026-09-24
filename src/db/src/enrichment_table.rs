@@ -42,97 +42,83 @@ use infra::table::enrichment_tables::ENRICHMENT_TABLE_META_STREAM_STATS_KEY;
 pub fn convert_recordbatch_to_vrl(
     batches: &[RecordBatch],
 ) -> Result<Vec<vrl::value::Value>, anyhow::Error> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config::get_config().limit.cpu_num)
-        .build()?;
-
     // Process batches in parallel, collecting rows from each batch
-    let vrl_records: Result<Vec<_>, _> = pool.install(|| {
-        batches
-            .par_iter()
-            .map(|batch| {
-                let schema = batch.schema();
-                let num_rows = batch.num_rows();
+    let vrl_records: Result<Vec<_>, _> = batches
+        .par_iter()
+        .map(|batch| {
+            let schema = batch.schema();
+            let num_rows = batch.num_rows();
 
-                // Process rows within a batch in parallel
-                (0..num_rows)
-                    .into_par_iter()
-                    .map(|row_idx| {
-                        let mut record_map = vrl::value::ObjectMap::new();
+            // Process rows within a batch in parallel
+            (0..num_rows)
+                .into_par_iter()
+                .map(|row_idx| {
+                    let mut record_map = vrl::value::ObjectMap::new();
 
-                        for (col_idx, field) in schema.fields().iter().enumerate() {
-                            let column = batch.column(col_idx);
-                            let field_name = field.name();
+                    for (col_idx, field) in schema.fields().iter().enumerate() {
+                        let column = batch.column(col_idx);
+                        let field_name = field.name();
 
-                            if column.is_null(row_idx) {
-                                record_map.insert(field_name.clone().into(), vrl::value::Value::Null);
-                                continue;
-                            }
-
-                            let vrl_value = match field.data_type() {
-                                DataType::Boolean => {
-                                    let array =
-                                        column.as_any().downcast_ref::<BooleanArray>().unwrap();
-                                    vrl::value::Value::Boolean(array.value(row_idx))
-                                }
-                                DataType::Int64 => {
-                                    let array =
-                                        column.as_any().downcast_ref::<Int64Array>().unwrap();
-                                    vrl::value::Value::Integer(array.value(row_idx))
-                                }
-                                DataType::UInt64 => {
-                                    let array =
-                                        column.as_any().downcast_ref::<UInt64Array>().unwrap();
-                                    vrl::value::Value::Integer(array.value(row_idx) as i64)
-                                }
-                                DataType::Float64 => {
-                                    let array =
-                                        column.as_any().downcast_ref::<Float64Array>().unwrap();
-                                    vrl::value::Value::Float(
-                                        NotNan::new(array.value(row_idx))
-                                            .unwrap_or(NotNan::new(0.0).unwrap()),
-                                    )
-                                }
-                                DataType::Utf8 => {
-                                    let array =
-                                        column.as_any().downcast_ref::<StringArray>().unwrap();
-                                    vrl::value::Value::from(array.value(row_idx))
-                                }
-                                DataType::Utf8View => {
-                                    let array =
-                                        column.as_any().downcast_ref::<StringViewArray>().unwrap();
-                                    vrl::value::Value::from(array.value(row_idx))
-                                }
-                                DataType::LargeUtf8 => {
-                                    let array = column
-                                        .as_any()
-                                        .downcast_ref::<LargeStringArray>()
-                                        .unwrap();
-                                    vrl::value::Value::from(array.value(row_idx))
-                                }
-                                DataType::Binary => {
-                                    let array =
-                                        column.as_any().downcast_ref::<BinaryArray>().unwrap();
-                                    vrl::value::Value::Bytes(array.value(row_idx).to_vec().into())
-                                }
-                                DataType::Null => vrl::value::Value::Null,
-                                _ => {
-                                    return Err(anyhow::anyhow!(
-                                        "Unsupported data type for RecordBatch to VRL conversion: {:?}",
-                                        field.data_type()
-                                    ));
-                                }
-                            };
-
-                            record_map.insert(field_name.clone().into(), vrl_value);
+                        if column.is_null(row_idx) {
+                            record_map.insert(field_name.clone().into(), vrl::value::Value::Null);
+                            continue;
                         }
 
-                        Ok(vrl::value::Value::Object(record_map))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect()
-    });
+                        let vrl_value = match field.data_type() {
+                            DataType::Boolean => {
+                                let array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+                                vrl::value::Value::Boolean(array.value(row_idx))
+                            }
+                            DataType::Int64 => {
+                                let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                                vrl::value::Value::Integer(array.value(row_idx))
+                            }
+                            DataType::UInt64 => {
+                                let array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+                                vrl::value::Value::Integer(array.value(row_idx) as i64)
+                            }
+                            DataType::Float64 => {
+                                let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
+                                vrl::value::Value::Float(
+                                    NotNan::new(array.value(row_idx))
+                                        .unwrap_or(NotNan::new(0.0).unwrap()),
+                                )
+                            }
+                            DataType::Utf8 => {
+                                let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+                                vrl::value::Value::from(array.value(row_idx))
+                            }
+                            DataType::Utf8View => {
+                                let array =
+                                    column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                                vrl::value::Value::from(array.value(row_idx))
+                            }
+                            DataType::LargeUtf8 => {
+                                let array =
+                                    column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                                vrl::value::Value::from(array.value(row_idx))
+                            }
+                            DataType::Binary => {
+                                let array = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+                                vrl::value::Value::Bytes(array.value(row_idx).to_vec().into())
+                            }
+                            DataType::Null => vrl::value::Value::Null,
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "Unsupported data type for RecordBatch to VRL conversion: {:?}",
+                                    field.data_type()
+                                ));
+                            }
+                        };
+
+                        record_map.insert(field_name.clone().into(), vrl_value);
+                    }
+
+                    Ok(vrl::value::Value::Object(record_map))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect();
 
     // Flatten the nested Vec<Vec<Value>> into Vec<Value>
     vrl_records.map(|batches| batches.into_iter().flatten().collect())

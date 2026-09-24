@@ -276,30 +276,21 @@ async fn fetch_from_memory_cache(
     }
 
     let batches_result: Result<Vec<_>, DataFusionError> = if target_partition > 1 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(target_partition)
-            .build()
-            .map_err(|e| {
-                DataFusionError::Execution(format!("Failed to create thread pool: {e}"))
-            })?;
+        let vrl_to_record_batch_timer = metrics.vrl_to_record_batch_time.timer();
+        let chunks: Vec<&[vrl::value::Value]> =
+            enrichment_data.as_ref().chunks(get_batch_size()).collect();
 
-        pool.install(|| {
-            let vrl_to_record_batch_timer = metrics.vrl_to_record_batch_time.timer();
-            let chunks: Vec<&[vrl::value::Value]> =
-                enrichment_data.as_ref().chunks(get_batch_size()).collect();
-
-            let result = chunks
-                .into_par_iter()
-                .map(|chunk| {
-                    let record_batch = convert_vrl_to_record_batch(&schema, chunk)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                    let num_rows = record_batch.num_rows();
-                    Ok((record_batch, num_rows))
-                })
-                .collect();
-            vrl_to_record_batch_timer.done();
-            result
-        })
+        let result = chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let record_batch = convert_vrl_to_record_batch(&schema, chunk)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                let num_rows = record_batch.num_rows();
+                Ok((record_batch, num_rows))
+            })
+            .collect();
+        vrl_to_record_batch_timer.done();
+        result
     } else {
         let vrl_to_record_batch_timer = metrics.vrl_to_record_batch_time.timer();
         let chunks: Vec<&[vrl::value::Value]> =

@@ -87,11 +87,7 @@ impl Values {
         match self {
             Values::Json(data) => Ok(Arc::clone(data)),
             Values::Vrl(data) => {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(config::get_config().limit.cpu_num)
-                    .build()?;
-                let json_data =
-                    pool.install(|| data.par_iter().map(transform::convert_from_vrl).collect());
+                let json_data = data.par_iter().map(transform::convert_from_vrl).collect();
                 Ok(Arc::new(json_data))
             }
             Values::RecordBatch(batches) => {
@@ -122,11 +118,7 @@ impl Values {
         match self {
             Values::Vrl(data) => Ok(Arc::clone(data)),
             Values::Json(data) => {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(config::get_config().limit.cpu_num)
-                    .build()?;
-                let vrl_data =
-                    pool.install(|| data.par_iter().map(transform::convert_to_vrl).collect());
+                let vrl_data = data.par_iter().map(transform::convert_to_vrl).collect();
                 Ok(Arc::new(vrl_data))
             }
             Values::RecordBatch(batches) => {

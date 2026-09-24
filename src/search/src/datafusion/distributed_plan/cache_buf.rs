@@ -110,11 +110,6 @@ impl CacheBuf {
                 .map(|b| b.as_ref().clone())
                 .collect()
         } else {
-            let thread_pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(partition_num)
-                .build()
-                .unwrap();
-
             let chunk_size = std::cmp::max(1, total_batch_len / partition_num);
             let batch_chunks: Vec<Vec<Arc<RecordBatch>>> = record_batchs
                 .chunks(chunk_size)
@@ -122,30 +117,28 @@ impl CacheBuf {
                 .collect();
 
             // Phase 1: process batch_chunks in parallel using rayon
-            let partial_results: Vec<Result<Vec<RecordBatch>>> = thread_pool.install(|| {
-                batch_chunks
-                    .into_par_iter()
-                    .map(|batches| match merge_mode {
-                        CacheStreamMode::Group => {
-                            let mut stream =
-                                GroupedHashAggregateStream::new(&self.cached_buf.aggregate_plan)
-                                    .unwrap();
-                            for batch in batches {
-                                stream.group_aggregate_batch(batch.as_ref().clone())?;
-                            }
-                            stream.get_final_result()
+            let partial_results: Vec<Result<Vec<RecordBatch>>> = batch_chunks
+                .into_par_iter()
+                .map(|batches| match merge_mode {
+                    CacheStreamMode::Group => {
+                        let mut stream =
+                            GroupedHashAggregateStream::new(&self.cached_buf.aggregate_plan)
+                                .unwrap();
+                        for batch in batches {
+                            stream.group_aggregate_batch(batch.as_ref().clone())?;
                         }
-                        CacheStreamMode::NoGroup => {
-                            let mut stream =
-                                AggregateStream::new(&self.cached_buf.aggregate_plan).unwrap();
-                            for batch in batches {
-                                stream.aggregate_batch(batch.as_ref().clone())?;
-                            }
-                            stream.finalize_aggregation()
+                        stream.get_final_result()
+                    }
+                    CacheStreamMode::NoGroup => {
+                        let mut stream =
+                            AggregateStream::new(&self.cached_buf.aggregate_plan).unwrap();
+                        for batch in batches {
+                            stream.aggregate_batch(batch.as_ref().clone())?;
                         }
-                    })
-                    .collect()
-            });
+                        stream.finalize_aggregation()
+                    }
+                })
+                .collect();
 
             let mut batches = Vec::new();
             for partial_result in partial_results {
