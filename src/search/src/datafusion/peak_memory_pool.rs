@@ -21,16 +21,21 @@ use std::{
     },
 };
 
-use datafusion::execution::memory_pool::{
-    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+use datafusion::{
+    error::DataFusionError,
+    execution::memory_pool::{
+        MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, human_readable_size,
+    },
 };
 
-/// A memory pool wrapper that tracks the peak memory usage during DataFusion execution.
-/// When dropped, it logs the peak memory usage.
+/// A per-query view of a (possibly shared) memory pool: tracks this query's own
+/// reservation and peak, optionally caps it, and logs the peak when dropped.
 #[derive(Debug)]
 pub struct PeakMemoryPool {
     trace_id: String,
     inner: Arc<dyn MemoryPool>,
+    limit: usize,
+    reserved: AtomicUsize,
     pub peak_memory: Arc<AtomicUsize>,
 }
 
@@ -39,12 +44,22 @@ impl PeakMemoryPool {
         Self {
             trace_id,
             inner,
+            limit: usize::MAX,
+            reserved: AtomicUsize::new(0),
             peak_memory: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    fn update_peak(&self, current: usize) {
+    /// Caps this query below the shared pool, e.g. for a smaller work group budget.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    fn add(&self, additional: usize) {
+        let current = self.reserved.fetch_add(additional, Ordering::Relaxed) + additional;
         self.peak_memory.fetch_max(current, Ordering::Relaxed);
+        add_reserved(additional as i64);
     }
 
     #[cfg(test)]
@@ -68,13 +83,12 @@ impl MemoryPool for PeakMemoryPool {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
-        add_reserved(additional as i64);
-        let current = self.inner.reserved();
-        self.update_peak(current);
+        self.add(additional);
     }
 
     fn shrink(&self, reservation: &MemoryReservation, size: usize) {
         self.inner.shrink(reservation, size);
+        self.reserved.fetch_sub(size, Ordering::Relaxed);
         add_reserved(-(size as i64));
     }
 
@@ -83,21 +97,32 @@ impl MemoryPool for PeakMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), datafusion::error::DataFusionError> {
-        let result = self.inner.try_grow(reservation, additional);
-        if result.is_ok() {
-            add_reserved(additional as i64);
-            let current = self.inner.reserved();
-            self.update_peak(current);
+        let current = self.reserved.load(Ordering::Relaxed);
+        if current.saturating_add(additional) > self.limit {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Failed to allocate additional {} for {}: query [trace_id {}] would exceed its limit of {} ({} already reserved)",
+                human_readable_size(additional),
+                reservation.consumer().name(),
+                self.trace_id,
+                human_readable_size(self.limit),
+                human_readable_size(current),
+            )));
         }
-        result
+        self.inner.try_grow(reservation, additional)?;
+        self.add(additional);
+        Ok(())
     }
 
+    /// This query's reservation, not the shared pool's total.
     fn reserved(&self) -> usize {
-        self.inner.reserved()
+        self.reserved.load(Ordering::Relaxed)
     }
 
     fn memory_limit(&self) -> MemoryLimit {
-        self.inner.memory_limit()
+        match self.inner.memory_limit() {
+            MemoryLimit::Finite(size) => MemoryLimit::Finite(size.min(self.limit)),
+            limit => limit,
+        }
     }
 }
 
