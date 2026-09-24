@@ -132,7 +132,7 @@ jobs:
                       /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-}" || true
           sudo swapoff -a || true
           sudo rm -f /mnt/swapfile /swapfile || true
-          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo fallocate -l 32G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
 
       - uses: actions/checkout@v5
