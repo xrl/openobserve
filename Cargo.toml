@@ -80,6 +80,16 @@ inherits = "release"
 codegen-units = 1
 lto = "thin"
 
+[profile.release-study]
+inherits = "release"
+codegen-units = 16
+lto = false
+
+[profile.release-study-debug]
+inherits = "release-study"
+debug = "line-tables-only"
+strip = false
+
 [profile.release-profiling]
 inherits = "release"
 debug = true
