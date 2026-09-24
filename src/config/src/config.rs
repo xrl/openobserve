@@ -3400,7 +3400,7 @@ pub fn init() -> Config {
 /// plus its own allocator arena, so the ceiling is an out-of-memory guard, not
 /// a sizing knob. Scale it with the CPU budget instead of pinning it at a flat
 /// 512 per runtime.
-fn default_blocking_worker_num(cpu_num: usize) -> usize {
+pub fn default_blocking_worker_num(cpu_num: usize) -> usize {
     max(16, cpu_num * 8)
 }
 
